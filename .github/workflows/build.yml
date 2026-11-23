@@ -1,0 +1,325 @@
+name: Build ImmortalWrt 25.12 Firmware & Endfield Theme
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly Sunday 10:00 Asia/Shanghai (02:00 UTC)
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      profiles:
+        description: "Target profiles to build"
+        type: choice
+        default: "all"
+        options:
+          - all
+          - x86_64-efi
+          - r68s
+      embed_endfield_theme:
+        description: "Pre-embed luci-theme-endfield into /rom"
+        type: boolean
+        default: true
+      fetch_latest_openclash:
+        description: "Bundle latest vernesong/OpenClash dev .apk (fresh Zashboard UI)"
+        type: boolean
+        default: true
+      embed_adguard:
+        description: "Pre-embed latest AdGuardHome binary at /opt/AdGuardHome/AdGuardHome"
+        type: boolean
+        default: true
+      publish_release:
+        description: "Publish artifacts as a GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate Profiles, Theme & Privacy Boundary
+    runs-on: ubuntu-24.04
+    outputs:
+      profiles_json: ${{ steps.resolve.outputs.profiles_json }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      theme_version: ${{ steps.resolve.outputs.theme_version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Syntax-check shell & Python scripts
+        run: |
+          sh -n imagebuilder/build.sh
+          sh -n luci-theme-endfield/scripts/stage-files.sh
+          sh -n luci-theme-endfield/scripts/install.sh
+          sh -n luci-theme-endfield/scripts/uninstall.sh
+          sh -n luci-theme-endfield/scripts/pack-release.sh
+          sh -n luci-theme-endfield/root/etc/uci-defaults/35_luci-theme-endfield
+          python3 -m py_compile imagebuilder/check-updates.py
+
+      - name: Dry-run ImageBuilder profiles
+        run: |
+          sh imagebuilder/build.sh --profile x86_64-efi --dry-run
+          sh imagebuilder/build.sh --profile r68s --dry-run
+
+      - name: Privacy leak guard (no private homelab IPs, domains, or tokens)
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          forbidden = re.compile(
+              r"(192\.168\.11[1-4]\.|sajo\.cc|oppoer\.me|oppoit\.com|HomoNet-|HomoLab-|BARK_URL=http)",
+              re.IGNORECASE,
+          )
+          hits = []
+          for p in sorted(pathlib.Path(".").rglob("*")):
+              if ".git" in p.parts or not p.is_file():
+                  continue
+              if p.as_posix() == ".github/workflows/build.yml":
+                  continue
+              try:
+                  text = p.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  continue
+              for idx, line in enumerate(text.splitlines(), 1):
+                  if forbidden.search(line):
+                      hits.append(f"{p}:{idx}: {line.strip()}")
+          if hits:
+              print("ERROR: private homelab references detected:\n" + "\n".join(hits), file=sys.stderr)
+              sys.exit(1)
+          print("Privacy audit passed: 0 private references found.")
+          PY
+
+      - name: Package standalone luci-theme-endfield tarball
+        run: |
+          VER="$(awk -F':=' '/^PKG_VERSION:=/ { print $2; exit }' luci-theme-endfield/Makefile)"
+          sh luci-theme-endfield/scripts/pack-release.sh --out-dir dist-theme --version "${VER:-0.1.0}"
+          ls -lh dist-theme/
+
+      - name: Upload standalone theme tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-theme-endfield-tarball
+          path: dist-theme/
+          retention-days: 14
+
+      - name: Resolve build matrix
+        id: resolve
+        run: |
+          VER="$(awk -F':=' '/^PKG_VERSION:=/ { print $2; exit }' luci-theme-endfield/Makefile)"
+          echo "theme_version=${VER:-0.1.0}" >> "$GITHUB_OUTPUT"
+
+          EVENT="${{ github.event_name }}"
+          REF="${{ github.ref }}"
+          INPUT_PROFILES="${{ inputs.profiles || 'all' }}"
+
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "$EVENT" = "schedule" ] || [[ "$REF" == refs/tags/v* ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$INPUT_PROFILES" = "x86_64-efi" ]; then
+            echo 'profiles_json=["x86_64-efi"]' >> "$GITHUB_OUTPUT"
+          elif [ "$INPUT_PROFILES" = "r68s" ]; then
+            echo 'profiles_json=["r68s"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'profiles_json=["x86_64-efi","r68s"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  build-firmware:
+    name: Build (${{ matrix.profile }})
+    needs: validate
+    if: needs.validate.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJson(needs.validate.outputs.profiles_json) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ImageBuilder host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl file gawk jq python3 rsync unzip zstd
+
+      - name: Resolve profile metadata
+        id: meta
+        run: |
+          . "imagebuilder/profiles/${{ matrix.profile }}.conf"
+          echo "release=$IMMORTALWRT_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "archive=$IMAGEBUILDER_ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "sha256=$IMAGEBUILDER_SHA256" >> "$GITHUB_OUTPUT"
+          if [ "$IMMORTALWRT_TARGET" = "x86" ]; then
+            echo "agh_arch=linux_amd64" >> "$GITHUB_OUTPUT"
+          else
+            echo "agh_arch=linux_arm64" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache ImmortalWrt ImageBuilder archive & package dl
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/immortalwrt-ib-work/cache
+          key: ib-${{ matrix.profile }}-${{ steps.meta.outputs.release }}-${{ steps.meta.outputs.sha256 }}
+          restore-keys: |
+            ib-${{ matrix.profile }}-${{ steps.meta.outputs.release }}-
+
+      - name: Fetch latest vernesong/OpenClash dev .apk (with SHA256 verify)
+        id: openclash
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.fetch_latest_openclash != false }}
+        run: |
+          mkdir -p /tmp/local-packages
+          OC_VER="$(curl -fsSL https://raw.githubusercontent.com/vernesong/OpenClash/package/dev/version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+          [ -n "$OC_VER" ] || { echo "Failed to resolve OpenClash dev version" >&2; exit 1; }
+          APK_NAME="luci-app-openclash-${OC_VER}.apk"
+          curl -fsSL --retry 3 -o "/tmp/local-packages/${APK_NAME}" \
+            "https://raw.githubusercontent.com/vernesong/OpenClash/package/dev/${APK_NAME}"
+          if curl -fsSL --retry 2 -o /tmp/oc-checksums.txt \
+            "https://raw.githubusercontent.com/vernesong/OpenClash/package/dev/checksums.txt"; then
+            EXPECTED="$(awk -v f="$APK_NAME" '$2 == f || $2 == "*"f { print $1; exit }' /tmp/oc-checksums.txt)"
+            if [ -n "$EXPECTED" ]; then
+              ACTUAL="$(sha256sum "/tmp/local-packages/${APK_NAME}" | awk '{print $1}')"
+              [ "$ACTUAL" = "$EXPECTED" ] || { echo "OpenClash SHA256 mismatch: expected=$EXPECTED actual=$ACTUAL" >&2; exit 1; }
+              echo "Verified OpenClash ${OC_VER} SHA256: $ACTUAL"
+            fi
+          fi
+          echo "version=$OC_VER" >> "$GITHUB_OUTPUT"
+          ls -lh /tmp/local-packages/
+
+      - name: Fetch latest AdGuardHome static binary (${{ steps.meta.outputs.agh_arch }})
+        id: adguard
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.embed_adguard != false }}
+        run: |
+          FINAL_URL="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/AdguardTeam/AdGuardHome/releases/latest)"
+          AGH_TAG="$(basename "$FINAL_URL")"
+          [ -n "$AGH_TAG" ] || { echo "Failed to resolve AdGuardHome tag" >&2; exit 1; }
+          ARCH="${{ steps.meta.outputs.agh_arch }}"
+          mkdir -p /tmp/agh-stage
+          curl -fsSL --retry 3 -o /tmp/agh-stage/AdGuardHome.tar.gz \
+            "https://github.com/AdguardTeam/AdGuardHome/releases/download/${AGH_TAG}/AdGuardHome_${ARCH}.tar.gz"
+          tar -xzf /tmp/agh-stage/AdGuardHome.tar.gz -C /tmp/agh-stage
+          test -x /tmp/agh-stage/AdGuardHome/AdGuardHome
+          echo "version=${AGH_TAG#v}" >> "$GITHUB_OUTPUT"
+          ls -lh /tmp/agh-stage/AdGuardHome/AdGuardHome
+
+      - name: Stage luci-theme-endfield into /rom overlay
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.embed_endfield_theme != false }}
+        run: |
+          rm -rf /tmp/extra-files
+          sh luci-theme-endfield/scripts/stage-files.sh /tmp/extra-files
+          find /tmp/extra-files -maxdepth 6 | sort
+
+      - name: Build ImmortalWrt firmware image
+        run: |
+          ARGS=(
+            --profile "${{ matrix.profile }}"
+            --work-dir /tmp/immortalwrt-ib-work
+            --out-dir "out/${{ matrix.profile }}"
+            --retries 3
+          )
+          if [ -d /tmp/local-packages ] && ls /tmp/local-packages/*.apk >/dev/null 2>&1; then
+            ARGS+=(--local-packages /tmp/local-packages)
+          fi
+          if [ -x /tmp/agh-stage/AdGuardHome/AdGuardHome ]; then
+            ARGS+=(--adguard-bin /tmp/agh-stage/AdGuardHome/AdGuardHome)
+          fi
+          if [ -d /tmp/extra-files ]; then
+            ARGS+=(--extra-files /tmp/extra-files)
+          fi
+          sh imagebuilder/build.sh "${ARGS[@]}"
+
+      - name: Package native luci-theme-endfield .apk (x86_64 host apk mkpkg)
+        if: matrix.profile == 'x86_64-efi'
+        run: |
+          HOST_APK="$(find /tmp/immortalwrt-ib-work/extract/x86_64-efi -maxdepth 5 -path '*/staging_dir/host/bin/apk' -type f | head -n 1 || true)"
+          sh luci-theme-endfield/scripts/pack-release.sh \
+            --out-dir "out/theme-pkg" \
+            --version "${{ needs.validate.outputs.theme_version }}" \
+            ${HOST_APK:+--apk-bin "$HOST_APK"}
+          ls -lh out/theme-pkg/
+
+      - name: Write build summary
+        run: |
+          {
+            echo "## Build Summary — \`${{ matrix.profile }}\`"
+            echo ""
+            echo "- **ImmortalWrt**: \`${{ steps.meta.outputs.release }}\`"
+            echo "- **OpenClash**: \`${{ steps.openclash.outputs.version || 'feed default' }}\`"
+            echo "- **AdGuardHome**: \`${{ steps.adguard.outputs.version || 'not embedded' }}\`"
+            echo "- **Endfield Theme**: \`v${{ needs.validate.outputs.theme_version }}\`"
+            echo ""
+            echo "### SHA256SUMS"
+            echo '```'
+            cat "out/${{ matrix.profile }}/SHA256SUMS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload firmware artifact (${{ matrix.profile }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.profile }}
+          path: |
+            out/${{ matrix.profile }}/bin/*.img.gz
+            out/${{ matrix.profile }}/bin/*.manifest
+            out/${{ matrix.profile }}/package-audit.txt
+            out/${{ matrix.profile }}/SHA256SUMS
+          retention-days: 14
+
+      - name: Upload standalone luci-theme-endfield package
+        if: matrix.profile == 'x86_64-efi'
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-theme-endfield-package
+          path: out/theme-pkg/
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: [validate, build-firmware]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Flatten release files & generate combined SHA256SUMS
+        id: prep
+        run: |
+          mkdir -p release-upload
+          find release-artifacts -type f \( -name '*.img.gz' -o -name '*.manifest' -o -name '*.apk' -o -name '*.tar.gz' \) -exec cp -f {} release-upload/ \;
+          for audit in release-artifacts/firmware-*/package-audit.txt; do
+            [ -f "$audit" ] || continue
+            prof="$(basename "$(dirname "$audit")" | sed 's/^firmware-//')"
+            cp -f "$audit" "release-upload/package-audit-${prof}.txt"
+          done
+          (cd release-upload && sha256sum * > SHA256SUMS)
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="build-$(date -u +%Y%m%d-%H%M%S)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          ls -lh release-upload/
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.prep.outputs.tag }}"
+          gh release create "$TAG" release-upload/* \
+            --title "ImmortalWrt 25.12 + luci-theme-endfield ($TAG)" \
+            --notes "Automated ImmortalWrt 25.12.x build with latest OpenClash dev UI, optional AdGuardHome binary, and \`luci-theme-endfield\`." \
+            --latest
