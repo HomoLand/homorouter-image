@@ -359,12 +359,15 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
           TAG="${{ steps.prep.outputs.tag }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release-upload/* --clobber
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-upload/* --repo "$GH_REPO" --clobber
           else
             gh release create "$TAG" release-upload/* \
+              --repo "$GH_REPO" \
               --title "ImmortalWrt 25.12 Firmware ($TAG)" \
               --notes "Automated ImmortalWrt 25.12.x build with latest OpenClash dev UI, optional AdGuardHome binary, and Endfield UI ([HomoLand/luci-theme-endfield](https://github.com/HomoLand/luci-theme-endfield), ref \`${{ needs.validate.outputs.endfield_ref }}\`)." \
               --latest
