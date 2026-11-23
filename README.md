@@ -1,62 +1,56 @@
-# HomoRouter Image Builder & `luci-theme-endfield`
+# HomoRouter Image Builder
 
-Declarative **ImmortalWrt 25.12.x** (`Linux 6.12 LTS`, `fw4`, `apk`) automated firmware builder for GitHub Actions, bundled with **`luci-theme-endfield`** — a universal, zero-CDN, dual-mode industrial theme for LuCI 25.12 inspired by *Arknights: Endfield*.
+Declarative **ImmortalWrt 25.12.x** (`Linux 6.12 LTS`, `fw4`, `apk`) automated firmware builder for GitHub Actions.
 
-> **Strict Public Boundary**: This repository contains only generic firmware profiles, build scripts, and the universal LuCI theme. No private IPs, domains, topologies, credentials, or subscriptions are stored here.
-
----
-
-## Features
-
-### 1. `luci-theme-endfield` (Universal LuCI 25.12 Theme)
-- **Zero view overrides**: Pure LuCI 25.12 shell (`header.ut` / `footer.ut` / `sysauth.ut`), dynamic sidebar (`menu-endfield.js`), and pure CSS (`cascade.css` / `mobile.css`). Works out of the box on any OpenWrt / ImmortalWrt 25.12 device regardless of installed plugins.
-- **Dual industrial palette**:
-  - **Titanium Charcoal (Dark)**: Deep anodized charcoal grid + signature Endfield Yellow (`#FFE600`) structural highlights & chamfered primary actions.
-  - **Industrial Matte (Light)**: Architectural matte concrete grid + obsidian structural plates (`#14171D`) with high-contrast Endfield Yellow accents.
-- **Dynamic navigation & `Ctrl+K` Command Palette**: Automatically indexes every installed LuCI route from `ui.menu.load()` for instant keyboard navigation (`Ctrl+K` quick jump, `[` collapsible sidebar).
-- **Native OpenClash `0.48.x` `.oc` CSS-variable bridge**: Automatically harmonizes OpenClash's modern UI with Endfield Light & Dark modes when OpenClash is on its default `classic` theme, while still respecting explicit user theme overrides inside OpenClash.
-- **Zero external CDN dependencies**: Instant offline/LAN loading with crisp 4K HiDPI typography and tabular numerals.
-
-### 2. GitHub Actions Automated Firmware Pipeline
-- **Supported profiles**:
-  - `x86_64-efi` — Unified EFI squashfs image (`128 MiB /boot`, `1 GiB` overlay, Intel I226-V / RTL8111 / Mellanox ConnectX-3, NVMe/eMMC/SATA)
-  - `r68s` — Lunzn FastRhino R68S (`rockchip/armv8`, `1 GiB` overlay, `kmod-r8125`)
-- **Automated freshness & guardrails**:
-  - Verifies official ImmortalWrt ImageBuilder archive SHA256 before extraction.
-  - Optionally bundles the latest `vernesong/OpenClash` `package/dev` `.apk` (with SHA256 verification) so fresh Zashboard / MetaCubeXD assets are baked directly into `/rom`.
-  - Optionally pre-embeds the latest upstream `AdGuardHome` binary at `/opt/AdGuardHome/AdGuardHome`.
-  - Enforces `REQUIRED_AUDIT_PACKAGES` and `FORBIDDEN_PACKAGES` on every built manifest and emits `package-audit.txt` + `SHA256SUMS`.
+> **Strict Public Boundary**: This repository contains only generic firmware profiles, ImageBuilder automation, and upstream update checks. No private IPs, domains, topologies, credentials, or subscriptions are stored here.
 
 ---
 
-## Quick Install (`luci-theme-endfield` Standalone)
+## Two-Repository Architecture
 
-### Option A: Native `.apk` (from GitHub Releases)
-```sh
-apk add --allow-untrusted luci-theme-endfield-*.apk
-```
+| Repository | Responsibility | Link |
+| --- | --- | --- |
+| **`HomoLand/homorouter-image`** *(this repo)* | Declarative ImmortalWrt 25.12.x profiles, ImageBuilder build/audit scripts, and firmware CI/CD pipeline | [`HomoLand/homorouter-image`](https://github.com/HomoLand/homorouter-image) |
+| **`HomoLand/luci-theme-endfield`** | Standalone universal LuCI 25.12 theme (`luci-theme-endfield`) and optional `ubus` Command Console (`luci-app-endfield-console`) | [`HomoLand/luci-theme-endfield`](https://github.com/HomoLand/luci-theme-endfield) |
 
-### Option B: Universal Tarball (any OpenWrt / ImmortalWrt 25.12 router)
-```sh
-tar -xzf luci-theme-endfield-*.tar.gz
-sh luci-theme-endfield-*/scripts/install.sh          # registers Endfield without changing default theme
-# or:
-sh luci-theme-endfield-*/scripts/install.sh --set-default
-```
+During firmware builds, [`.github/workflows/build.yml`](.github/workflows/build.yml) checks out [`HomoLand/luci-theme-endfield`](https://github.com/HomoLand/luci-theme-endfield) (configurable via `endfield_theme_ref`, default `main`) and runs its `scripts/stage-files.sh` to bake the Endfield theme and/or Command Console cleanly into `/rom`.
 
-Then select **Endfield** (auto), **EndfieldDark**, or **EndfieldLight** under **System → System → Language and Style**.
-
-To uninstall cleanly (automatically reverts to Bootstrap if active):
-```sh
-sh luci-theme-endfield-*/scripts/uninstall.sh
-```
+If you only want the theme or Command Console for an existing OpenWrt / ImmortalWrt 25.12 router, install directly from [`HomoLand/luci-theme-endfield`](https://github.com/HomoLand/luci-theme-endfield) — no custom firmware flash required.
 
 ---
 
-## Local ImageBuilder Dry-Run
+## Supported Firmware Profiles
+
+- **`x86_64-efi`** — Unified EFI squashfs image (`128 MiB /boot`, `1 GiB` overlay, Intel I226-V / RTL8111 / Mellanox ConnectX-3, NVMe/eMMC/SATA)
+- **`r68s`** — Lunzn FastRhino R68S (`rockchip/armv8`, `1 GiB` overlay, `kmod-r8125`)
+
+---
+
+## Pipeline Features & Guardrails
+
+- **Verified ImageBuilder download**: Checks official ImmortalWrt ImageBuilder archive SHA256 prior to extraction and persists the `dl/` cache across builds.
+- **Fresh OpenClash dev UI**: Optionally bundles the latest `vernesong/OpenClash` `package/dev` `.apk` (with SHA256 verification) so fresh Zashboard / MetaCubeXD assets live in `/rom`.
+- **Optional AdGuardHome static binary**: Optionally embeds the latest upstream `AdGuardHome` binary at `/opt/AdGuardHome/AdGuardHome` (`0755`).
+- **Configurable Endfield UI embedding**: Toggle `embed_endfield_theme` (`true`), `embed_endfield_console` (`true`), and `endfield_theme_ref` (`main`, tag, or SHA) on manual workflow runs.
+- **Package & Privacy Audits**: Enforces `REQUIRED_AUDIT_PACKAGES` and `FORBIDDEN_PACKAGES` on every built manifest, emitting `package-audit.txt` and `SHA256SUMS`.
+
+---
+
+## Local Usage
 
 ```sh
+# Validate profiles without downloading ImageBuilder
 sh imagebuilder/build.sh --profile x86_64-efi --dry-run
 sh imagebuilder/build.sh --profile r68s --dry-run
+
+# Check upstream ImmortalWrt / OpenClash / AdGuardHome updates
 python3 imagebuilder/check-updates.py --profile x86_64-efi
+```
+
+To embed `luci-theme-endfield` and `luci-app-endfield-console` during a local firmware build:
+
+```sh
+git clone https://github.com/HomoLand/luci-theme-endfield.git /tmp/luci-theme-endfield
+sh /tmp/luci-theme-endfield/scripts/stage-files.sh --with-console /tmp/extra-files
+sh imagebuilder/build.sh --profile x86_64-efi --extra-files /tmp/extra-files
 ```

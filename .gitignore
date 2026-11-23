@@ -2,6 +2,7 @@ out/
 dist-theme/
 release-artifacts/
 release-upload/
+_luci-theme-endfield/
 __pycache__/
 *.pyc
 .DS_Store

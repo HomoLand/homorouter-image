@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12 Firmware & Endfield Theme
+name: Build ImmortalWrt 25.12 Firmware
 
 on:
   push:
@@ -23,6 +23,14 @@ on:
         description: "Pre-embed luci-theme-endfield into /rom"
         type: boolean
         default: true
+      embed_endfield_console:
+        description: "Pre-embed luci-app-endfield-console into /rom"
+        type: boolean
+        default: true
+      endfield_theme_ref:
+        description: "Git ref (branch, tag, or SHA) of HomoLand/luci-theme-endfield"
+        type: string
+        default: "main"
       fetch_latest_openclash:
         description: "Bundle latest vernesong/OpenClash dev .apk (fresh Zashboard UI)"
         type: boolean
@@ -37,32 +45,48 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   validate:
-    name: Validate Profiles, Theme & Privacy Boundary
+    name: Validate Profiles & Privacy Boundary
     runs-on: ubuntu-24.04
     outputs:
       profiles_json: ${{ steps.resolve.outputs.profiles_json }}
       should_build: ${{ steps.resolve.outputs.should_build }}
-      theme_version: ${{ steps.resolve.outputs.theme_version }}
+      endfield_ref: ${{ steps.resolve.outputs.endfield_ref }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Verify pure LF line endings
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+          bad = []
+          for p in sorted(pathlib.Path(".").rglob("*")):
+              if ".git" in p.parts or not p.is_file():
+                  continue
+              data = p.read_bytes()
+              if b"\x00" in data:
+                  continue
+              if b"\r" in data:
+                  bad.append(f"{p}: contains CR/CRLF bytes")
+              if data.startswith(b"\xef\xbb\xbf"):
+                  bad.append(f"{p}: contains UTF-8 BOM")
+          if bad:
+              print("ERROR: line-ending/BOM check failed:\n" + "\n".join(bad), file=sys.stderr)
+              sys.exit(1)
+          print("Line-ending audit passed: 100% pure LF.")
+          PY
+
       - name: Syntax-check shell & Python scripts
         run: |
           sh -n imagebuilder/build.sh
-          sh -n luci-theme-endfield/scripts/stage-files.sh
-          sh -n luci-theme-endfield/scripts/install.sh
-          sh -n luci-theme-endfield/scripts/uninstall.sh
-          sh -n luci-theme-endfield/scripts/pack-release.sh
-          sh -n luci-theme-endfield/root/etc/uci-defaults/35_luci-theme-endfield
           python3 -m py_compile imagebuilder/check-updates.py
 
       - name: Dry-run ImageBuilder profiles
@@ -74,15 +98,22 @@ jobs:
         run: |
           python3 - <<'PY'
           import pathlib, re, sys
-          forbidden = re.compile(
-              r"(192\.168\.11[1-4]\.|sajo\.cc|oppoer\.me|oppoit\.com|HomoNet-|HomoLab-|BARK_URL=http)",
-              re.IGNORECASE,
-          )
+          patterns = [
+              r"192\.168\." + r"11[0-9]\.",
+              r"10\.225\.",
+              r"100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.",
+              "sajo" + r"\.cc",
+              "oppoer" + r"\.me",
+              "oppoit" + r"\.com",
+              "Homo" + "Net-",
+              "Homo" + "Lab-",
+              "BARK_" + "URL=http",
+              r"(?:ghp_|github_pat_|glpat-)[A-Za-z0-9_]{10,}",
+          ]
+          forbidden = re.compile("|".join(patterns), re.IGNORECASE)
           hits = []
           for p in sorted(pathlib.Path(".").rglob("*")):
               if ".git" in p.parts or not p.is_file():
-                  continue
-              if p.as_posix() == ".github/workflows/build.yml":
                   continue
               try:
                   text = p.read_text(encoding="utf-8")
@@ -97,38 +128,27 @@ jobs:
           print("Privacy audit passed: 0 private references found.")
           PY
 
-      - name: Package standalone luci-theme-endfield tarball
-        run: |
-          VER="$(awk -F':=' '/^PKG_VERSION:=/ { print $2; exit }' luci-theme-endfield/Makefile)"
-          sh luci-theme-endfield/scripts/pack-release.sh --out-dir dist-theme --version "${VER:-0.1.0}"
-          ls -lh dist-theme/
-
-      - name: Upload standalone theme tarball
-        uses: actions/upload-artifact@v4
-        with:
-          name: luci-theme-endfield-tarball
-          path: dist-theme/
-          retention-days: 14
-
       - name: Resolve build matrix
         id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_PROFILES: ${{ inputs.profiles }}
+          INPUT_ENDFIELD_REF: ${{ inputs.endfield_theme_ref }}
         run: |
-          VER="$(awk -F':=' '/^PKG_VERSION:=/ { print $2; exit }' luci-theme-endfield/Makefile)"
-          echo "theme_version=${VER:-0.1.0}" >> "$GITHUB_OUTPUT"
+          PROFILES="${INPUT_PROFILES:-all}"
+          ENDFIELD_REF="${INPUT_ENDFIELD_REF:-main}"
+          echo "endfield_ref=$ENDFIELD_REF" >> "$GITHUB_OUTPUT"
 
-          EVENT="${{ github.event_name }}"
-          REF="${{ github.ref }}"
-          INPUT_PROFILES="${{ inputs.profiles || 'all' }}"
-
-          if [ "$EVENT" = "workflow_dispatch" ] || [ "$EVENT" = "schedule" ] || [[ "$REF" == refs/tags/v* ]]; then
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "$EVENT" = "schedule" ] || [ "${REF#refs/tags/v}" != "$REF" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           fi
 
-          if [ "$INPUT_PROFILES" = "x86_64-efi" ]; then
+          if [ "$PROFILES" = "x86_64-efi" ]; then
             echo 'profiles_json=["x86_64-efi"]' >> "$GITHUB_OUTPUT"
-          elif [ "$INPUT_PROFILES" = "r68s" ]; then
+          elif [ "$PROFILES" = "r68s" ]; then
             echo 'profiles_json=["r68s"]' >> "$GITHUB_OUTPUT"
           else
             echo 'profiles_json=["x86_64-efi","r68s"]' >> "$GITHUB_OUTPUT"
@@ -144,8 +164,16 @@ jobs:
       matrix:
         profile: ${{ fromJson(needs.validate.outputs.profiles_json) }}
     steps:
-      - name: Checkout repository
+      - name: Checkout homorouter-image
         uses: actions/checkout@v4
+
+      - name: Checkout HomoLand/luci-theme-endfield
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.embed_endfield_theme != false || inputs.embed_endfield_console != false }}
+        uses: actions/checkout@v4
+        with:
+          repository: HomoLand/luci-theme-endfield
+          ref: ${{ needs.validate.outputs.endfield_ref }}
+          path: _luci-theme-endfield
 
       - name: Install ImageBuilder host dependencies
         run: |
@@ -213,12 +241,42 @@ jobs:
           echo "version=${AGH_TAG#v}" >> "$GITHUB_OUTPUT"
           ls -lh /tmp/agh-stage/AdGuardHome/AdGuardHome
 
-      - name: Stage luci-theme-endfield into /rom overlay
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.embed_endfield_theme != false }}
+      - name: Stage Endfield theme & console into /rom overlay
+        id: endfield
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_THEME: ${{ inputs.embed_endfield_theme }}
+          IN_CONSOLE: ${{ inputs.embed_endfield_console }}
         run: |
           rm -rf /tmp/extra-files
-          sh luci-theme-endfield/scripts/stage-files.sh /tmp/extra-files
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            EMBED_THEME=true
+            EMBED_CONSOLE=true
+          else
+            EMBED_THEME="${IN_THEME:-true}"
+            EMBED_CONSOLE="${IN_CONSOLE:-true}"
+          fi
+
+          if [ "$EMBED_THEME" = "true" ] && [ "$EMBED_CONSOLE" = "true" ]; then
+            STAGE_FLAG="--with-console"
+            MODE_LABEL="theme+console"
+          elif [ "$EMBED_THEME" = "true" ]; then
+            STAGE_FLAG="--theme-only"
+            MODE_LABEL="theme-only"
+          elif [ "$EMBED_CONSOLE" = "true" ]; then
+            STAGE_FLAG="--console-only"
+            MODE_LABEL="console-only"
+          else
+            echo "mode=not embedded" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          sh _luci-theme-endfield/scripts/stage-files.sh "$STAGE_FLAG" /tmp/extra-files
           find /tmp/extra-files -maxdepth 6 | sort
+
+          VER="$(awk -F':=' '/^PKG_VERSION:=/ { print $2; exit }' _luci-theme-endfield/luci-theme-endfield/Makefile 2>/dev/null || true)"
+          SHA="$(git -C _luci-theme-endfield rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          echo "mode=${MODE_LABEL} (v${VER:-unknown}, ${SHA})" >> "$GITHUB_OUTPUT"
 
       - name: Build ImmortalWrt firmware image
         run: |
@@ -239,16 +297,6 @@ jobs:
           fi
           sh imagebuilder/build.sh "${ARGS[@]}"
 
-      - name: Package native luci-theme-endfield .apk (x86_64 host apk mkpkg)
-        if: matrix.profile == 'x86_64-efi'
-        run: |
-          HOST_APK="$(find /tmp/immortalwrt-ib-work/extract/x86_64-efi -maxdepth 5 -path '*/staging_dir/host/bin/apk' -type f | head -n 1 || true)"
-          sh luci-theme-endfield/scripts/pack-release.sh \
-            --out-dir "out/theme-pkg" \
-            --version "${{ needs.validate.outputs.theme_version }}" \
-            ${HOST_APK:+--apk-bin "$HOST_APK"}
-          ls -lh out/theme-pkg/
-
       - name: Write build summary
         run: |
           {
@@ -257,7 +305,7 @@ jobs:
             echo "- **ImmortalWrt**: \`${{ steps.meta.outputs.release }}\`"
             echo "- **OpenClash**: \`${{ steps.openclash.outputs.version || 'feed default' }}\`"
             echo "- **AdGuardHome**: \`${{ steps.adguard.outputs.version || 'not embedded' }}\`"
-            echo "- **Endfield Theme**: \`v${{ needs.validate.outputs.theme_version }}\`"
+            echo "- **Endfield UI**: \`${{ steps.endfield.outputs.mode || 'not embedded' }}\` (ref \`${{ needs.validate.outputs.endfield_ref }}\`)"
             echo ""
             echo "### SHA256SUMS"
             echo '```'
@@ -276,19 +324,13 @@ jobs:
             out/${{ matrix.profile }}/SHA256SUMS
           retention-days: 14
 
-      - name: Upload standalone luci-theme-endfield package
-        if: matrix.profile == 'x86_64-efi'
-        uses: actions/upload-artifact@v4
-        with:
-          name: luci-theme-endfield-package
-          path: out/theme-pkg/
-          retention-days: 14
-
   release:
     name: Publish GitHub Release
     needs: [validate, build-firmware]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -299,14 +341,14 @@ jobs:
         id: prep
         run: |
           mkdir -p release-upload
-          find release-artifacts -type f \( -name '*.img.gz' -o -name '*.manifest' -o -name '*.apk' -o -name '*.tar.gz' \) -exec cp -f {} release-upload/ \;
+          find release-artifacts -type f \( -name '*.img.gz' -o -name '*.manifest' \) -exec cp -f {} release-upload/ \;
           for audit in release-artifacts/firmware-*/package-audit.txt; do
             [ -f "$audit" ] || continue
             prof="$(basename "$(dirname "$audit")" | sed 's/^firmware-//')"
             cp -f "$audit" "release-upload/package-audit-${prof}.txt"
           done
           (cd release-upload && sha256sum * > SHA256SUMS)
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          if [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then
             TAG="${GITHUB_REF_NAME}"
           else
             TAG="build-$(date -u +%Y%m%d-%H%M%S)"
@@ -319,7 +361,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.prep.outputs.tag }}"
-          gh release create "$TAG" release-upload/* \
-            --title "ImmortalWrt 25.12 + luci-theme-endfield ($TAG)" \
-            --notes "Automated ImmortalWrt 25.12.x build with latest OpenClash dev UI, optional AdGuardHome binary, and \`luci-theme-endfield\`." \
-            --latest
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-upload/* --clobber
+          else
+            gh release create "$TAG" release-upload/* \
+              --title "ImmortalWrt 25.12 Firmware ($TAG)" \
+              --notes "Automated ImmortalWrt 25.12.x build with latest OpenClash dev UI, optional AdGuardHome binary, and Endfield UI ([HomoLand/luci-theme-endfield](https://github.com/HomoLand/luci-theme-endfield), ref \`${{ needs.validate.outputs.endfield_ref }}\`)." \
+              --latest
+          fi
